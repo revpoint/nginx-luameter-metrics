@@ -1,0 +1,187 @@
+#!/usr/bin/env python
+import os
+import random
+import re
+import socket
+import threading
+import time
+from datetime import datetime
+from typing import List, Mapping, Pattern, Optional
+
+import influxdb
+import pytz
+import requests
+
+SERVER_HOST = os.environ.get('SERVER_HOST', 'localhost')
+SERVER_PORT = os.environ.get('SERVER_PORT', '8001')
+SERVER_SCHEMA = os.environ.get('SERVER_SCHEMA', 'http')
+SERVER_HOSTNAME = os.environ.get('SERVER_HOSTNAME', socket.gethostname())
+SERVICE_NAME = os.environ.get('SERVICE_NAME', 'nginx')
+
+INFLUXDB_RETENTION_DURATION = os.environ.get('INFLUXDB_RETENTION_DURATION', '7d')
+INFLUXDB_RETENTION_REPLICATION = os.environ.get('INFLUXDB_RETENTION_REPLICATION', '1')
+INFLUXDB_TIME_PRECISION = os.environ.get('INFLUXDB_TIME_PRECISION', 'm')
+INFLUXDB_PREFIX = os.environ.get('INFLUXDB_PREFIX', 'nginx')
+
+TIMER_JITTER_RANGE = os.environ.get('INFLUXDB_RETENTION_REPLICATION', '5')
+
+
+def format_zone_name(name):
+    name = name.replace('.', r'\.').replace('*', '.+')
+    return r'^{}$'.format(name)
+
+
+def format_nginx_zones(lookup_list: str) -> Pattern:
+    zones = [
+        format_zone_name(z.strip())
+        for z in lookup_list.split(',')
+        if z.strip()
+    ]
+    if zones:
+        return re.compile('|'.join(zones))
+
+
+NGINX_ZONE_WHITELIST = format_nginx_zones(os.environ.get('NGINX_ZONE_WHITELIST', ''))
+NGINX_ZONE_BLACKLIST = format_nginx_zones(os.environ.get('NGINX_ZONE_BLACKLIST', ''))
+
+
+def collect_nginx_stats(host=SERVER_HOST, port=SERVER_PORT, schema=SERVER_SCHEMA):
+    url = f'{schema}://{host}:{port}/stats'
+    try:
+        response = requests.get(url)
+        if response.ok:
+            data = response.json()
+            return {'uptime': data['uptime'], 'zones': data['zones']}
+    except:
+        print(f'Cannot connect to {url}')
+
+
+def clean_value(value):
+    if isinstance(value, int):
+        value = float(value)
+    return value
+
+
+def format_influx_data(metrics: Mapping[str, int], timestamp: datetime=None,
+                       tags: dict=None) -> List[dict]:
+    points = []
+    timestamp = timestamp or datetime.utcnow().replace(tzinfo=pytz.utc)
+    for key, value in metrics.items():
+        if isinstance(value, dict):
+            value['value'] = value.get('mean', None)
+            fields = {k: clean_value(v) for k, v in value.items()}
+        else:
+            fields = {'value': clean_value(value)}
+        points.append({
+            'measurement': f'{INFLUXDB_PREFIX}.{key}',
+            'tags': tags or {},
+            'time': timestamp,
+            'fields': fields
+        })
+    return points
+
+
+def get_metrics_for_server() -> Optional[List[dict]]:
+    nginx_data = collect_nginx_stats()
+    if not nginx_data:
+        return
+
+    timestamp = datetime.utcnow().replace(tzinfo=pytz.utc)
+    zones = nginx_data.pop('zones', {})
+
+    metrics = format_influx_data(nginx_data, timestamp)
+
+    for zone, stats in zones.items():
+        if NGINX_ZONE_BLACKLIST and NGINX_ZONE_BLACKLIST.match(zone):
+            continue
+        if NGINX_ZONE_WHITELIST and not NGINX_ZONE_WHITELIST.match(zone):
+            continue
+
+        zone_stats = {
+            'latency': stats['latency'],
+            'rates': stats['rates'],
+            'received': stats['received'],
+            'sent': stats['sent'],
+            'requests': stats['requests'],
+        }
+        for label, value in stats['responses'].items():
+            zone_stats[f'responses_{label}'] = value
+
+        metrics.extend(format_influx_data(zone_stats, timestamp, tags={'zone': zone}))
+
+    return metrics
+
+
+def get_server_tags() -> dict:
+    return {
+        'service': SERVICE_NAME,
+        'node': SERVER_HOSTNAME,
+    }
+
+
+def get_influx_client(influx_dsn: str) -> influxdb.InfluxDBClient:
+    client = influxdb.InfluxDBClient.from_dsn(influx_dsn)
+    db_name = client._database
+    if db_name:
+        existing_dbs = client.get_list_database()
+        for db in existing_dbs:
+            if db['name'] == db_name:
+                break
+        else:
+            client.create_database(db_name)
+            client.create_retention_policy(f'{db_name}_policy',
+                                           INFLUXDB_RETENTION_DURATION,
+                                           int(INFLUXDB_RETENTION_REPLICATION),
+                                           default=True)
+    return client
+
+
+def main(influx_dsn):
+    influx = get_influx_client(influx_dsn)
+    metrics = get_metrics_for_server()
+    if metrics:
+        print(f'Writing {len(metrics)} points for: {SERVER_HOSTNAME}')
+        tags = get_server_tags()
+        influx.write_points(metrics, tags=tags, time_precision=INFLUXDB_TIME_PRECISION)
+    else:
+        print(f'ERROR: Could not load metrics for: {SERVER_HOSTNAME}')
+
+
+class RepeatEveryMinute(object):
+    def __init__(self, func, *args, **kwargs):
+        self._timer = None
+        self.interval = 60
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.is_running = False
+        jitter = random.random() * int(TIMER_JITTER_RANGE)
+        self.next_call = ((time.time() // 60) * 60) + jitter  # Start at beginning of minute
+        print(f'Starting in {self.next_call + self.interval - time.time():0.1f} seconds')
+        self.start()
+
+    def _run(self):
+        self.is_running = False
+        self.start()
+        self.func(*self.args, **self.kwargs)
+
+    def start(self):
+        if not self.is_running:
+            self.next_call += self.interval
+            self._timer = threading.Timer(self.next_call - time.time(), self._run)
+            self._timer.start()
+            self.is_running = True
+
+    def stop(self):
+        self._timer.cancel()
+        self.is_running = False
+
+
+if __name__ == '__main__':
+    import sys
+
+    if len(sys.argv) != 2:
+        print(f'Usage: {sys.argv[0]} INFLUX_DSN')
+        sys.exit(1)
+
+    RepeatEveryMinute(main, sys.argv[1])
