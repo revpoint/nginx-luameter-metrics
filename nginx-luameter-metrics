@@ -156,7 +156,7 @@ class RepeatEveryMinute(object):
         self.kwargs = kwargs
         self.is_running = False
         jitter = random.random() * int(TIMER_JITTER_RANGE)
-        self.next_call = ((time.time() // 60) * 60) + jitter  # Start at beginning of minute
+        self.next_call = (time.time() // 60 * 60) + 5 + jitter  # Start at 5 secs after beginning of minute
         print(f'Starting in {self.next_call + self.interval - time.time():0.1f} seconds')
         self.start()
 
