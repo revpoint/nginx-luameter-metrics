@@ -2,8 +2,8 @@
 import os
 import random
 import re
+import sched
 import socket
-import threading
 import time
 from datetime import datetime
 from typing import List, Mapping, Pattern, Optional
@@ -26,14 +26,11 @@ INFLUXDB_PREFIX = os.environ.get('INFLUXDB_PREFIX', 'nginx')
 TIMER_JITTER_RANGE = os.environ.get('INFLUXDB_RETENTION_REPLICATION', '5')
 
 
-def format_zone_name(name):
-    name = name.replace('.', r'\.').replace('*', '.+')
-    return r'^{}$'.format(name)
-
-
 def format_nginx_zones(lookup_list: str) -> Pattern:
     zones = [
-        format_zone_name(z.strip())
+        '^{}$'.format(
+            z.strip().replace('.', r'\.').replace('*', '.+')
+        )
         for z in lookup_list.split(',')
         if z.strip()
     ]
@@ -147,34 +144,22 @@ def main(influx_dsn):
         print(f'ERROR: Could not load metrics for: {SERVER_HOSTNAME}')
 
 
-class RepeatEveryMinute(object):
-    def __init__(self, func, *args, **kwargs):
-        self._timer = None
-        self.interval = 60
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-        self.is_running = False
-        jitter = random.random() * int(TIMER_JITTER_RANGE)
-        self.next_call = (time.time() // 60 * 60) + 5 + jitter  # Start at 5 secs after beginning of minute
-        print(f'Starting in {self.next_call + self.interval - time.time():0.1f} seconds')
-        self.start()
+def run_every_minute(func, *args, **kwargs):
+    scheduler = sched.scheduler(time.time)
+    offset = 5 + (random.random() * int(TIMER_JITTER_RANGE))
 
-    def _run(self):
-        self.is_running = False
-        self.start()
-        self.func(*self.args, **self.kwargs)
+    def get_next_runtime():
+        current_minute = time.time() // 60
+        next_minute = (current_minute + 1) * 60
+        return next_minute + offset
 
-    def start(self):
-        if not self.is_running:
-            self.next_call += self.interval
-            self._timer = threading.Timer(self.next_call - time.time(), self._run)
-            self._timer.start()
-            self.is_running = True
+    def repeat_func():
+        scheduler.enterabs(get_next_runtime(), 1, repeat_func)
+        func(*args, **kwargs)
 
-    def stop(self):
-        self._timer.cancel()
-        self.is_running = False
+    print(f'Scheduled to run in {int(get_next_runtime() - time.time())} seconds.')
+    scheduler.enterabs(get_next_runtime(), 1, repeat_func)
+    scheduler.run()
 
 
 if __name__ == '__main__':
@@ -184,4 +169,4 @@ if __name__ == '__main__':
         print(f'Usage: {sys.argv[0]} INFLUX_DSN')
         sys.exit(1)
 
-    RepeatEveryMinute(main, sys.argv[1])
+    run_every_minute(main, sys.argv[1])
